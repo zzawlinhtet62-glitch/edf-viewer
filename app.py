@@ -6,9 +6,11 @@ import numpy as np
 import streamlit as st
 import mne
 import yasa
+import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
+from sklearn.metrics import confusion_matrix as sk_confusion_matrix, cohen_kappa_score
 
 # ── page config ──────────────────────────────────────────────────────────────
 st.set_page_config(page_title="EDF Viewer", layout="wide")
@@ -19,8 +21,14 @@ st.markdown(
     <style>
     /* tighten top padding */
     .block-container { padding-top: 1.2rem; }
-    /* epoch nav buttons */
-    div[data-testid="stColumns"] button { width: 100%; }
+    /* epoch nav buttons — prevent text wrapping */
+    div[data-testid="stColumns"] button {
+        width: 100%;
+        white-space: nowrap;
+        padding-left: 0.3rem;
+        padding-right: 0.3rem;
+        font-size: 0.85rem;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -544,16 +552,41 @@ def _jump_to_stage(target: str):
             return
 
 
+def _jump_to_disagree():
+    """Jump to the next epoch where technician and YASA labels disagree."""
+    cur = st.session_state.epoch
+    if not per_epoch_stages or not yasa_per_epoch:
+        return
+    for j in range(cur + 1, n_epochs):
+        t = per_epoch_stages[j] if j < len(per_epoch_stages) else None
+        a = yasa_per_epoch[j] if j < len(yasa_per_epoch) else None
+        if t is not None and a is not None and t != a:
+            st.session_state.epoch = j
+            return
+    # wrap around
+    for j in range(0, cur):
+        t = per_epoch_stages[j] if j < len(per_epoch_stages) else None
+        a = yasa_per_epoch[j] if j < len(yasa_per_epoch) else None
+        if t is not None and a is not None and t != a:
+            st.session_state.epoch = j
+            return
+
+
 # ── epoch navigation bar ────────────────────────────────────────────────────
 show_stage_btns = active_per_epoch is not None
-nav_cols = st.columns(
-    [1, 1, 2, 1, 1] + ([1] * len(STAGE_JUMP_TARGETS) if show_stage_btns else [])
-)
+has_both = has_tech and has_yasa
+# Build column weights: widen the epoch input, keep buttons compact
+_nav_weights = [1, 0.7, 2.5, 0.7, 1]
+if show_stage_btns:
+    _nav_weights += [0.8] * len(STAGE_JUMP_TARGETS)
+if has_both:
+    _nav_weights += [0.7]
+nav_cols = st.columns(_nav_weights)
 
 with nav_cols[0]:
-    st.button("⏪ −100", use_container_width=True, on_click=_step, args=(-100,))
+    st.button("⏪−100", use_container_width=True, on_click=_step, args=(-100,))
 with nav_cols[1]:
-    st.button("◀ −1", use_container_width=True, on_click=_step, args=(-1,))
+    st.button("◀−1", use_container_width=True, on_click=_step, args=(-1,))
 with nav_cols[2]:
     st.number_input(
         "Epoch",
@@ -564,16 +597,24 @@ with nav_cols[2]:
         key="epoch",
     )
 with nav_cols[3]:
-    st.button("+1 ▶", use_container_width=True, on_click=_step, args=(1,))
+    st.button("+1▶", use_container_width=True, on_click=_step, args=(1,))
 with nav_cols[4]:
-    st.button("+100 ⏩", use_container_width=True, on_click=_step, args=(100,))
+    st.button("+100⏩", use_container_width=True, on_click=_step, args=(100,))
 
-# stage jump buttons
+# stage jump buttons (use short labels: →R instead of →REM)
+_STAGE_SHORT = {"W": "W", "N1": "N1", "N2": "N2", "N3": "N3", "REM": "R"}
 if show_stage_btns:
     for i, target in enumerate(STAGE_JUMP_TARGETS):
         with nav_cols[5 + i]:
-            st.button(f"→{target}", use_container_width=True,
+            st.button(f"→{_STAGE_SHORT[target]}", use_container_width=True,
                       on_click=_jump_to_stage, args=(target,))
+
+# ≠ button — jump to next disagreement (only when both tech & YASA exist)
+if has_both:
+    _neq_idx = 5 + (len(STAGE_JUMP_TARGETS) if show_stage_btns else 0)
+    with nav_cols[_neq_idx]:
+        st.button("≠", use_container_width=True, on_click=_jump_to_disagree,
+                  help="跳到下一個技師與自動判期不一致的 epoch")
 
 cur_epoch = clamp_epoch(st.session_state.epoch)
 
@@ -666,77 +707,75 @@ fig.update_layout(
 
 st.plotly_chart(fig, use_container_width=True)
 
-# ── hypnogram overview & sleep metrics ──────────────────────────────────────
+# ── pre-compute stage data (used by metrics, hypnogram, and comparison) ────
+stages_norm = normalize_stages(stages) if stages else []
+yasa_stages_norm: list[tuple[float, float, str]] = []
+if yasa_labels:
+    yasa_stages_tuples = [(i * 30.0, 30.0, lbl) for i, lbl in enumerate(yasa_labels)]
+    yasa_stages_norm = normalize_stages(yasa_stages_tuples)
+
+# ── sleep metrics (always visible when technician data exists) ─────────────
+if stages_norm:
+    metrics = compute_sleep_metrics(stages_norm, stages, trim_wake=trim_wake)
+
+    if metrics:
+        row1 = st.columns(3)
+        row1[0].metric(
+            "SE",
+            f"{metrics['se']}%",
+            help="睡眠效率 Sleep Efficiency = TST ÷ TIB × 100",
+        )
+        row1[1].metric(
+            "TST",
+            f"{metrics['tst']} min",
+            help="總睡眠時間 Total Sleep Time：所有非 W 階段的總時長（不含 Movement time / Sleep stage ?）",
+        )
+        row1[2].metric(
+            "SOL",
+            f"{metrics['sol']} min" if metrics["sol"] is not None else "—",
+            help="入睡潛伏期 Sleep Onset Latency：從 TIB 起點到第一個非 W epoch",
+        )
+
+        row2 = st.columns(3)
+        row2[0].metric(
+            "REM Latency",
+            f"{metrics['rem_latency']} min" if metrics["rem_latency"] is not None else "—",
+            help="REM 潛伏期：從第一個非 W epoch 到第一個 REM epoch",
+        )
+        row2[1].metric(
+            "WASO",
+            f"{metrics['waso']} min" if metrics["waso"] is not None else "—",
+            help="入睡後清醒 Wake After Sleep Onset：sleep onset 到 final awakening 之間的 W 總時長",
+        )
+        row2[2].metric(
+            "Awakenings",
+            f"{metrics['awakenings']}" if metrics["awakenings"] is not None else "—",
+            help="覺醒次數：sleep onset 到 final awakening 之間 W 片段（bout）的個數",
+        )
+
+        # caption: show TIB range in clock time
+        if meas_date:
+            t0 = meas_date + timedelta(seconds=metrics["tib_start_s"])
+            t1 = meas_date + timedelta(seconds=metrics["tib_end_s"])
+            tib_range = f"{t0.strftime('%H:%M')}–{t1.strftime('%H:%M')}"
+        else:
+            tib_range = (
+                f"{int(metrics['tib_start_s'] // 60)}′–"
+                f"{int(metrics['tib_end_s'] // 60)}′"
+            )
+        if metrics["trimmed"]:
+            st.caption(
+                f"TIB {tib_range}（{metrics['tib']} min），"
+                "已排除記錄前後長 W 區段（onset 前 30 min 起算）"
+            )
+        else:
+            st.caption(
+                f"TIB {tib_range}（{metrics['tib']} min），"
+                "從記錄起點到最後一個非 W epoch"
+            )
+
+# ── hypnogram chart (shown when checkbox is on) ───────────────────────────
 if (has_tech or has_yasa) and show_hypnogram:
-    stages_norm = normalize_stages(stages) if stages else []
-
-    # Build YASA stages in (onset, dur, label) form for hypnogram
-    yasa_stages_norm: list[tuple[float, float, str]] = []
-    if yasa_labels:
-        yasa_stages_tuples = [(i * 30.0, 30.0, lbl) for i, lbl in enumerate(yasa_labels)]
-        yasa_stages_norm = normalize_stages(yasa_stages_tuples)
-
-    # ── sleep metrics (from technician stages) ─────────────────────────
-    if stages_norm:
-        metrics = compute_sleep_metrics(stages_norm, stages, trim_wake=trim_wake)
-
-        if metrics:
-            row1 = st.columns(3)
-            row1[0].metric(
-                "SE",
-                f"{metrics['se']}%",
-                help="睡眠效率 Sleep Efficiency = TST ÷ TIB × 100",
-            )
-            row1[1].metric(
-                "TST",
-                f"{metrics['tst']} min",
-                help="總睡眠時間 Total Sleep Time：所有非 W 階段的總時長（不含 Movement time / Sleep stage ?）",
-            )
-            row1[2].metric(
-                "SOL",
-                f"{metrics['sol']} min" if metrics["sol"] is not None else "—",
-                help="入睡潛伏期 Sleep Onset Latency：從 TIB 起點到第一個非 W epoch",
-            )
-
-            row2 = st.columns(3)
-            row2[0].metric(
-                "REM Latency",
-                f"{metrics['rem_latency']} min" if metrics["rem_latency"] is not None else "—",
-                help="REM 潛伏期：從第一個非 W epoch 到第一個 REM epoch",
-            )
-            row2[1].metric(
-                "WASO",
-                f"{metrics['waso']} min" if metrics["waso"] is not None else "—",
-                help="入睡後清醒 Wake After Sleep Onset：sleep onset 到 final awakening 之間的 W 總時長",
-            )
-            row2[2].metric(
-                "Awakenings",
-                f"{metrics['awakenings']}" if metrics["awakenings"] is not None else "—",
-                help="覺醒次數：sleep onset 到 final awakening 之間 W 片段（bout）的個數",
-            )
-
-            # caption: show TIB range in clock time
-            if meas_date:
-                t0 = meas_date + timedelta(seconds=metrics["tib_start_s"])
-                t1 = meas_date + timedelta(seconds=metrics["tib_end_s"])
-                tib_range = f"{t0.strftime('%H:%M')}–{t1.strftime('%H:%M')}"
-            else:
-                tib_range = (
-                    f"{int(metrics['tib_start_s'] // 60)}′–"
-                    f"{int(metrics['tib_end_s'] // 60)}′"
-                )
-            if metrics["trimmed"]:
-                st.caption(
-                    f"TIB {tib_range}（{metrics['tib']} min），"
-                    "已排除記錄前後長 W 區段（onset 前 30 min 起算）"
-                )
-            else:
-                st.caption(
-                    f"TIB {tib_range}（{metrics['tib']} min），"
-                    "從記錄起點到最後一個非 W epoch"
-                )
-
-    # ── hypnogram chart ─────────────────────────────────────────────────
     rec_start = meas_date if meas_date else datetime(2000, 1, 1)
     epoch_marker_t = rec_start + timedelta(seconds=cur_epoch * epoch_len + epoch_len / 2)
 
@@ -750,7 +789,6 @@ if (has_tech or has_yasa) and show_hypnogram:
     )
 
     if tech_segments and yasa_segments:
-        # ── dual subplot: technician (top) + YASA (bottom) ─────────────
         fig_hyp = make_subplots(
             rows=2, cols=1, shared_xaxes=True,
             subplot_titles=["技師判讀", "自動判期（YASA）"],
@@ -758,8 +796,6 @@ if (has_tech or has_yasa) and show_hypnogram:
         )
         add_hyp_traces_to_fig(fig_hyp, tech_segments, rec_start, row=1, show_legend=True)
         add_hyp_traces_to_fig(fig_hyp, yasa_segments, rec_start, row=2, show_legend=False)
-
-        # epoch marker on both rows
         for r in (1, 2):
             fig_hyp.add_vline(
                 x=epoch_marker_t, line_dash="dash",
@@ -771,7 +807,6 @@ if (has_tech or has_yasa) and show_hypnogram:
             text=f"Epoch {cur_epoch}", font_color="#FFD700",
             showarrow=False, row=1, col=1,
         )
-
         fig_hyp.update_yaxes(**y_axis_cfg, row=1, col=1)
         fig_hyp.update_yaxes(**y_axis_cfg, row=2, col=1)
         fig_hyp.update_xaxes(title="Time", tickformat="%H:%M", row=2, col=1)
@@ -787,9 +822,7 @@ if (has_tech or has_yasa) and show_hypnogram:
         st.plotly_chart(fig_hyp, use_container_width=True)
 
     elif tech_segments or yasa_segments:
-        # ── single hypnogram (technician-only or YASA-only) ────────────
         segments = tech_segments or yasa_segments
-
         fig_hyp = go.Figure()
         stage_x: dict[str, list] = {s: [] for s in HYP_STAGE_Y}
         stage_y_data: dict[str, list] = {s: [] for s in HYP_STAGE_Y}
@@ -798,20 +831,14 @@ if (has_tech or has_yasa) and show_hypnogram:
             t1 = rec_start + timedelta(seconds=s1)
             stage_x[stg].extend([t0, t1, None])
             stage_y_data[stg].extend([HYP_STAGE_Y[stg], HYP_STAGE_Y[stg], None])
-
         for stg in ("W", "REM", "N1", "N2", "N3"):
             if stage_x[stg]:
                 fig_hyp.add_trace(
                     go.Scatter(
-                        x=stage_x[stg],
-                        y=stage_y_data[stg],
-                        mode="lines",
-                        line=dict(color=HYP_COLORS[stg], width=3),
-                        name=stg,
+                        x=stage_x[stg], y=stage_y_data[stg], mode="lines",
+                        line=dict(color=HYP_COLORS[stg], width=3), name=stg,
                     )
                 )
-
-        # vertical connectors between stages
         conn_x: list = []
         conn_y: list = []
         for i in range(len(segments) - 1):
@@ -824,43 +851,155 @@ if (has_tech or has_yasa) and show_hypnogram:
         if conn_x:
             fig_hyp.add_trace(
                 go.Scatter(
-                    x=conn_x,
-                    y=conn_y,
-                    mode="lines",
+                    x=conn_x, y=conn_y, mode="lines",
                     line=dict(color="#888", width=1),
-                    showlegend=False,
-                    hoverinfo="skip",
+                    showlegend=False, hoverinfo="skip",
                 )
             )
-
-        # current-epoch vertical marker
         fig_hyp.add_vline(
-            x=epoch_marker_t,
-            line_dash="dash",
-            line_color="#FFD700",
-            line_width=1.5,
-            annotation_text=f"Epoch {cur_epoch}",
-            annotation_position="top",
-            annotation_font_color="#FFD700",
+            x=epoch_marker_t, line_dash="dash", line_color="#FFD700",
+            line_width=1.5, annotation_text=f"Epoch {cur_epoch}",
+            annotation_position="top", annotation_font_color="#FFD700",
         )
-
         fig_hyp.update_layout(
             height=250,
             margin=dict(l=60, r=80, t=10, b=40),
             yaxis=y_axis_cfg,
             xaxis=dict(title="Time", tickformat="%H:%M"),
-            legend=dict(
-                orientation="v",
-                yanchor="middle",
-                y=0.5,
-                xanchor="left",
-                x=1.01,
-            ),
-            hovermode="x",
-            dragmode="zoom",
+            legend=dict(orientation="v", yanchor="middle", y=0.5,
+                        xanchor="left", x=1.01),
+            hovermode="x", dragmode="zoom",
         )
-
         st.plotly_chart(fig_hyp, use_container_width=True)
+
+# ── A. 判期比對 (Staging Agreement) ────────────────────────────────────────
+if has_both:
+    # Pair epochs where both have a label
+    _COMPARE_STAGES = ["W", "N1", "N2", "N3", "REM"]
+    tech_arr = per_epoch_stages or []
+    auto_arr = yasa_per_epoch or []
+    paired = [
+        (tech_arr[i], auto_arr[i])
+        for i in range(min(len(tech_arr), len(auto_arr)))
+        if tech_arr[i] is not None and auto_arr[i] is not None
+    ]
+
+    if paired:
+        y_true = [p[0] for p in paired]
+        y_pred = [p[1] for p in paired]
+        n_total = len(paired)
+        n_agree = sum(1 for t, a in paired if t == a)
+        n_disagree = n_total - n_agree
+        agree_pct = n_agree / n_total * 100
+        kappa = cohen_kappa_score(y_true, y_pred)
+
+        with st.expander(
+            f"📊 判期比對　一致率 {agree_pct:.1f}%　"
+            f"Cohen κ {kappa:.3f}　"
+            f"（{n_total} 個 epoch，{n_disagree} 個不一致）",
+            expanded=False,
+        ):
+            # Confusion matrix
+            labels_present = [s for s in _COMPARE_STAGES
+                              if s in set(y_true) or s in set(y_pred)]
+            cm = sk_confusion_matrix(y_true, y_pred, labels=labels_present)
+
+            # Build DataFrame: rows=tech, cols=YASA, + subtotal + agreement rate
+            df_cm = pd.DataFrame(cm, index=labels_present, columns=labels_present)
+            df_cm.insert(0, "技師小計", df_cm.sum(axis=1))
+            per_stage_agree = []
+            for i, stg in enumerate(labels_present):
+                row_sum = cm[i].sum()
+                diag = cm[i][i]
+                per_stage_agree.append(
+                    f"{diag / row_sum * 100:.1f}%" if row_sum > 0 else "—"
+                )
+            df_cm["逐期一致率"] = per_stage_agree
+            df_cm.index.name = "技師＼YASA"
+
+            st.dataframe(df_cm, use_container_width=True)
+
+            st.caption(
+                "列＝技師判讀，欄＝YASA 自動判期。"
+                "N1 兩邊最難對上是常態——人類判讀者之間在 N1 的一致度本來就最低。"
+                "自動判期是輔助定位用的，不能取代技師判讀。"
+            )
+
+    # ── B. 各階段時間與佔比 ────────────────────────────────────────────────
+    if paired:
+        with st.expander("📊 各階段時間與佔比", expanded=False):
+            # Count epochs per stage
+            tech_counts = {s: 0 for s in _COMPARE_STAGES}
+            auto_counts = {s: 0 for s in _COMPARE_STAGES}
+            for t_lbl, a_lbl in paired:
+                if t_lbl in tech_counts:
+                    tech_counts[t_lbl] += 1
+                if a_lbl in auto_counts:
+                    auto_counts[a_lbl] += 1
+
+            epoch_min = epoch_len / 60.0  # seconds per epoch → minutes
+
+            tech_tst_epochs = sum(v for k, v in tech_counts.items() if k != "W")
+            auto_tst_epochs = sum(v for k, v in auto_counts.items() if k != "W")
+            tech_tib_epochs = sum(tech_counts.values())
+            auto_tib_epochs = sum(auto_counts.values())
+
+            # Bar chart
+            fig_bar = go.Figure()
+            tech_mins = [tech_counts[s] * epoch_min for s in _COMPARE_STAGES]
+            auto_mins = [auto_counts[s] * epoch_min for s in _COMPARE_STAGES]
+
+            fig_bar.add_trace(go.Bar(
+                name="技師判讀",
+                x=_COMPARE_STAGES, y=tech_mins,
+                text=[f"{v:.1f}" for v in tech_mins],
+                textposition="outside",
+                marker_color="#2C5F8A",
+            ))
+            fig_bar.add_trace(go.Bar(
+                name="自動判期",
+                x=_COMPARE_STAGES, y=auto_mins,
+                text=[f"{v:.1f}" for v in auto_mins],
+                textposition="outside",
+                marker_color="#7EC8E3",
+            ))
+            fig_bar.update_layout(
+                barmode="group",
+                yaxis_title="分鐘",
+                height=350,
+                margin=dict(l=50, r=20, t=30, b=40),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                            xanchor="right", x=1),
+            )
+            st.plotly_chart(fig_bar, use_container_width=True)
+
+            # Table
+            rows = []
+            for s in _COMPARE_STAGES:
+                t_min = tech_counts[s] * epoch_min
+                a_min = auto_counts[s] * epoch_min
+                if s == "W":
+                    t_pct = (tech_counts[s] / tech_tib_epochs * 100
+                             if tech_tib_epochs else 0)
+                    a_pct = (auto_counts[s] / auto_tib_epochs * 100
+                             if auto_tib_epochs else 0)
+                else:
+                    t_pct = (tech_counts[s] / tech_tst_epochs * 100
+                             if tech_tst_epochs else 0)
+                    a_pct = (auto_counts[s] / auto_tst_epochs * 100
+                             if auto_tst_epochs else 0)
+                rows.append({
+                    "階段": s,
+                    "技師(分)": round(t_min, 1),
+                    "技師%": f"{t_pct:.1f}%",
+                    "自動(分)": round(a_min, 1),
+                    "自動%": f"{a_pct:.1f}%",
+                    "差異(分)": round(t_min - a_min, 1),
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True,
+                         hide_index=True)
+
+            st.caption("W 的百分比以 TIB 為分母，其餘各期以 TST 為分母")
 
 # ── channel statistics (collapsed) ──────────────────────────────────────────
 with st.expander("📈 Channel statistics", expanded=False):
