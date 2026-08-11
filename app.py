@@ -5,6 +5,7 @@ import glob
 import numpy as np
 import streamlit as st
 import mne
+import yasa
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
@@ -27,16 +28,32 @@ st.markdown(
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 
-STAGE_MAP = {
-    "Sleep stage W": "W",
-    "Sleep stage 1": "N1",
-    "Sleep stage 2": "N2",
-    "Sleep stage 3": "N3",
-    "Sleep stage 4": "N4",
-    "Sleep stage R": "REM",
-    "Sleep stage ?": "?",
-    "Movement time": "MT",
+# Canonical aliases → normalised label (W / N1 / N2 / N3 / REM).
+# Anything that doesn't map is treated as unscored (None).
+_STAGE_ALIAS: dict[str, str] = {
+    "W": "W", "WAKE": "W",
+    "1": "N1", "N1": "N1", "S1": "N1",
+    "2": "N2", "N2": "N2", "S2": "N2",
+    "3": "N3", "N3": "N3", "S3": "N3",
+    "4": "N3", "N4": "N3", "S4": "N3",
+    "R": "REM", "REM": "REM",
 }
+
+
+def normalize_label(raw_label: str | None) -> str | None:
+    """Normalise any sleep-stage string to W / N1 / N2 / N3 / REM.
+
+    Handles 'Sleep stage ...' prefixes, YASA labels (WAKE / R), and various
+    legacy notations.  Returns ``None`` for unscored / movement / unknown.
+    """
+    if not raw_label:
+        return None
+    s = raw_label.strip()
+    # strip common prefix from Sleep-EDF hypnograms
+    if s.lower().startswith("sleep stage "):
+        s = s[len("sleep stage "):]
+    s = s.strip().upper()
+    return _STAGE_ALIAS.get(s)
 
 STAGE_COLORS = {
     "W": "#e74c3c",
@@ -63,6 +80,7 @@ HYP_COLORS = {
 }
 
 
+
 # ── helpers ──────────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner="Loading EDF…")
 def load_raw(path: str) -> mne.io.BaseRaw:
@@ -76,7 +94,7 @@ def load_hypnogram(path: str):
     annot = mne.read_annotations(path)
     stages = []
     for onset, dur, desc in zip(annot.onset, annot.duration, annot.description):
-        label = STAGE_MAP.get(desc)
+        label = normalize_label(desc)
         if label is not None:
             stages.append((float(onset), float(dur), label))
     stages.sort(key=lambda x: x[0])
@@ -105,11 +123,20 @@ def stage_at(stages, t: float) -> str | None:
 
 
 def epoch_stages(stages, epoch_len: float, n_epochs: int) -> list[str | None]:
-    """Pre-compute stage for each epoch (by epoch midpoint)."""
-    result = []
-    for i in range(n_epochs):
-        mid = i * epoch_len + epoch_len / 2
-        result.append(stage_at(stages, mid))
+    """Expand annotation segments into per-epoch labels.
+
+    For each annotation (onset, duration, label), every epoch whose start
+    falls inside [onset, onset+duration) is assigned that label.  Epochs
+    not covered by any annotation remain ``None``.
+    """
+    result: list[str | None] = [None] * n_epochs
+    for onset, dur, label in stages:
+        if label is None:
+            continue
+        i_start = max(0, int(onset / epoch_len))
+        i_end = min(n_epochs, int((onset + dur) / epoch_len))
+        for i in range(i_start, i_end):
+            result[i] = label
     return result
 
 
@@ -227,6 +254,124 @@ def compute_sleep_metrics(stages_norm, stages_all, trim_wake=True):
     )
 
 
+# ── YASA helpers ─────────────────────────────────────────────────────────────
+
+def detect_channels(ch_names: list[str]) -> dict:
+    """Auto-detect EEG / EOG / EMG channel names for YASA."""
+    result = {}
+    ch_lower = {ch: ch.lower() for ch in ch_names}
+
+    # EEG: prefer Fpz-Cz
+    for ch, low in ch_lower.items():
+        if "fpz-cz" in low or "fpz_cz" in low:
+            result["eeg_name"] = ch
+            break
+    if "eeg_name" not in result:
+        for ch, low in ch_lower.items():
+            if "eeg" in low or "fpz" in low or "cz" in low or "c4" in low or "c3" in low:
+                result["eeg_name"] = ch
+                break
+    if "eeg_name" not in result:
+        # fallback: first channel
+        result["eeg_name"] = ch_names[0]
+
+    # EOG: prefer 'horizontal'
+    for ch, low in ch_lower.items():
+        if "horizontal" in low:
+            result["eog_name"] = ch
+            break
+    if "eog_name" not in result:
+        for ch, low in ch_lower.items():
+            if "eog" in low:
+                result["eog_name"] = ch
+                break
+
+    # EMG: prefer 'submental'
+    for ch, low in ch_lower.items():
+        if "submental" in low:
+            result["emg_name"] = ch
+            break
+    if "emg_name" not in result:
+        for ch, low in ch_lower.items():
+            if "emg" in low:
+                result["emg_name"] = ch
+                break
+
+    return result
+
+
+@st.cache_data(show_spinner=False)
+def run_yasa_staging(_raw, edf_path: str, eeg_name: str,
+                     eog_name: str | None = None,
+                     emg_name: str | None = None) -> list[str]:
+    """Run YASA SleepStaging; return per-30s-epoch labels (W/N1/N2/N3/REM).
+
+    *_raw* is prefixed with _ so st.cache_data skips hashing it;
+    *edf_path* (+ channel names) serves as the cache key.
+    """
+    kwargs = {"eeg_name": eeg_name}
+    if eog_name:
+        kwargs["eog_name"] = eog_name
+    if emg_name:
+        kwargs["emg_name"] = emg_name
+    sls = yasa.SleepStaging(_raw, **kwargs)
+    pred = sls.predict()
+    # yasa ≥0.7 returns a Hypnogram object with .hypno (pd.Series);
+    # older versions return a plain list / ndarray of strings.
+    if hasattr(pred, "hypno"):
+        labels = list(pred.hypno)
+    else:
+        labels = list(np.asarray(pred).ravel())
+    # normalise to W / N1 / N2 / N3 / REM
+    return [normalize_label(s) or s for s in labels]
+
+
+def add_hyp_traces_to_fig(fig, segments, rec_start, row, show_legend=True):
+    """Add hypnogram traces (coloured stage lines + connectors) to a subplot row."""
+    stage_x: dict[str, list] = {s: [] for s in HYP_STAGE_Y}
+    stage_y_data: dict[str, list] = {s: [] for s in HYP_STAGE_Y}
+    for s0, s1, stg in segments:
+        t0 = rec_start + timedelta(seconds=s0)
+        t1 = rec_start + timedelta(seconds=s1)
+        stage_x[stg].extend([t0, t1, None])
+        stage_y_data[stg].extend([HYP_STAGE_Y[stg], HYP_STAGE_Y[stg], None])
+
+    for stg in ("W", "REM", "N1", "N2", "N3"):
+        if stage_x[stg]:
+            fig.add_trace(
+                go.Scatter(
+                    x=stage_x[stg],
+                    y=stage_y_data[stg],
+                    mode="lines",
+                    line=dict(color=HYP_COLORS[stg], width=3),
+                    name=stg,
+                    showlegend=show_legend,
+                    legendgroup=stg,
+                ),
+                row=row, col=1,
+            )
+
+    # vertical connectors between adjacent stages
+    conn_x: list = []
+    conn_y: list = []
+    for i in range(len(segments) - 1):
+        _, e1, stg1 = segments[i]
+        s2, _, stg2 = segments[i + 1]
+        if abs(e1 - s2) < 1:
+            t = rec_start + timedelta(seconds=e1)
+            conn_x.extend([t, t, None])
+            conn_y.extend([HYP_STAGE_Y[stg1], HYP_STAGE_Y[stg2], None])
+    if conn_x:
+        fig.add_trace(
+            go.Scatter(
+                x=conn_x, y=conn_y, mode="lines",
+                line=dict(color="#888", width=1),
+                showlegend=False, hoverinfo="skip",
+            ),
+            row=row, col=1,
+        )
+
+
 # ── sidebar: file selection ─────────────────────────────────────────────────
 st.sidebar.subheader("📂 File")
 
@@ -282,23 +427,89 @@ st.sidebar.subheader("⏱ Epoch")
 epoch_len = st.sidebar.number_input("Epoch length (s)", min_value=1, max_value=300, value=30, step=1)
 n_epochs = int(np.ceil(duration / epoch_len))
 
-# ── hypnogram ────────────────────────────────────────────────────────────────
+# ── hypnogram (technician) ──────────────────────────────────────────────────
 hyp_path = find_hypnogram(edf_path)
 stages = load_hypnogram(hyp_path) if hyp_path else None
 per_epoch_stages = epoch_stages(stages, epoch_len, n_epochs) if stages else None
 
+# ── sidebar: YASA auto-staging ──────────────────────────────────────────────
+st.sidebar.subheader("🤖 自動判期")
+st.sidebar.caption(f"yasa v{yasa.__version__}")
+yasa_labels: list[str] | None = None
+yasa_per_epoch: list[str | None] | None = None
+yasa_can_run = (epoch_len == 30)
+
+if not yasa_can_run:
+    st.sidebar.warning("YASA 固定使用 30 秒 epoch，目前設定不是 30 秒，已停用自動判期。")
+else:
+    ch_map = detect_channels(raw.ch_names)
+    ch_info_parts = [f"EEG: {ch_map['eeg_name']}"]
+    if "eog_name" in ch_map:
+        ch_info_parts.append(f"EOG: {ch_map['eog_name']}")
+    if "emg_name" in ch_map:
+        ch_info_parts.append(f"EMG: {ch_map['emg_name']}")
+    st.sidebar.caption("偵測頻道：" + "、".join(ch_info_parts))
+
+    if st.sidebar.button("執行自動判期（YASA）"):
+        st.session_state.yasa_path = edf_path
+
+    if st.session_state.get("yasa_path") == edf_path:
+        with st.spinner("🤖 YASA 自動分期運算中，請稍候…"):
+            yasa_labels = run_yasa_staging(
+                raw, edf_path,
+                eeg_name=ch_map["eeg_name"],
+                eog_name=ch_map.get("eog_name"),
+                emg_name=ch_map.get("emg_name"),
+            )
+        # Length-mismatch guard: warn if YASA vs technician differ by >2 epochs
+        if per_epoch_stages:
+            tech_epoch_count = sum(1 for s in per_epoch_stages if s is not None)
+            if abs(len(yasa_labels) - tech_epoch_count) > 2:
+                st.warning(
+                    f"⚠️ YASA 與技師判讀的 epoch 數不一致"
+                    f"（YASA: {len(yasa_labels)}, 技師: {tech_epoch_count}），"
+                    "以較短的為準對齊比較。"
+                )
+        # Build per-epoch list aligned to viewer epochs; pad / trim as needed
+        yasa_per_epoch = list(yasa_labels)
+        while len(yasa_per_epoch) < n_epochs:
+            yasa_per_epoch.append(None)
+        yasa_per_epoch = yasa_per_epoch[:n_epochs]
+        st.sidebar.success("自動：YASA（已快取）")
+
 # ── sidebar: hypnogram overview toggle ──────────────────────────────────────
-if stages:
+has_tech = stages is not None
+has_yasa = yasa_per_epoch is not None
+
+if has_tech or has_yasa:
     st.sidebar.subheader("🌙 Hypnogram")
     show_hypnogram = st.sidebar.checkbox("顯示 hypnogram", value=False)
-    trim_wake = st.sidebar.checkbox(
-        "排除記錄前後的長 W 區段",
-        value=True,
-        help="勾選時 TIB 從 sleep onset 前 30 分鐘算起；取消則從記錄起點算起",
-    )
+    if has_tech:
+        trim_wake = st.sidebar.checkbox(
+            "排除記錄前後的長 W 區段",
+            value=True,
+            help="勾選時 TIB 從 sleep onset 前 30 分鐘算起；取消則從記錄起點算起",
+        )
+    else:
+        trim_wake = True
 else:
     show_hypnogram = False
     trim_wake = True
+
+# ── sidebar: jump source radio ──────────────────────────────────────────────
+if has_tech and has_yasa:
+    jump_source = st.sidebar.radio("分期跳轉依據", ["技師", "自動"], horizontal=True)
+elif has_tech:
+    jump_source = "技師"
+elif has_yasa:
+    jump_source = "自動"
+else:
+    jump_source = None
+
+# Which per-epoch list drives the stage-jump buttons?
+active_per_epoch = (
+    yasa_per_epoch if jump_source == "自動" else per_epoch_stages
+)
 
 # ── epoch state ──────────────────────────────────────────────────────────────
 # The number_input owns st.session_state.epoch via key="epoch".
@@ -318,20 +529,26 @@ def _step(delta: int):
 
 def _jump_to_stage(target: str):
     cur = st.session_state.epoch
+    src = active_per_epoch
+    if src is None:
+        return
     # search forward from current epoch
     for j in range(cur + 1, n_epochs):
-        if per_epoch_stages[j] == target:
+        if src[j] == target:
             st.session_state.epoch = j
             return
     # wrap around from the beginning
     for j in range(0, cur):
-        if per_epoch_stages[j] == target:
+        if src[j] == target:
             st.session_state.epoch = j
             return
 
 
 # ── epoch navigation bar ────────────────────────────────────────────────────
-nav_cols = st.columns([1, 1, 2, 1, 1] + ([1] * len(STAGE_JUMP_TARGETS) if stages else []))
+show_stage_btns = active_per_epoch is not None
+nav_cols = st.columns(
+    [1, 1, 2, 1, 1] + ([1] * len(STAGE_JUMP_TARGETS) if show_stage_btns else [])
+)
 
 with nav_cols[0]:
     st.button("⏪ −100", use_container_width=True, on_click=_step, args=(-100,))
@@ -352,7 +569,7 @@ with nav_cols[4]:
     st.button("+100 ⏩", use_container_width=True, on_click=_step, args=(100,))
 
 # stage jump buttons
-if stages and per_epoch_stages:
+if show_stage_btns:
     for i, target in enumerate(STAGE_JUMP_TARGETS):
         with nav_cols[5 + i]:
             st.button(f"→{target}", use_container_width=True,
@@ -361,15 +578,33 @@ if stages and per_epoch_stages:
 cur_epoch = clamp_epoch(st.session_state.epoch)
 
 # ── current sleep stage display ──────────────────────────────────────────────
-if stages:
-    cur_stage = stage_at(stages, cur_epoch * epoch_len + epoch_len / 2)
-    if cur_stage:
-        color = STAGE_COLORS.get(cur_stage, "#888")
-        st.markdown(
-            f'<p style="font-size:1.8rem; font-weight:700; color:{color}; margin:0 0 0.3rem 0;">'
-            f"{cur_stage}</p>",
-            unsafe_allow_html=True,
-        )
+tech_stage = (
+    per_epoch_stages[cur_epoch]
+    if per_epoch_stages and cur_epoch < len(per_epoch_stages)
+    else None
+)
+auto_stage = (
+    yasa_per_epoch[cur_epoch]
+    if yasa_per_epoch and cur_epoch < len(yasa_per_epoch)
+    else None
+)
+
+if tech_stage or auto_stage:
+    parts: list[str] = []
+    if tech_stage:
+        tc = STAGE_COLORS.get(tech_stage, "#888")
+        parts.append(f'<span style="color:{tc};">技師：{tech_stage}</span>')
+    if auto_stage:
+        ac = STAGE_COLORS.get(auto_stage, "#888")
+        parts.append(f'<span style="color:{ac};">自動：{auto_stage}</span>')
+    if tech_stage and auto_stage and tech_stage == auto_stage:
+        parts.append('<span style="color:#2ecc71; font-size:1.6rem;">✓</span>')
+    st.markdown(
+        '<p style="font-size:1.8rem; font-weight:700; margin:0 0 0.3rem 0;">'
+        + " &nbsp;│&nbsp; ".join(parts)
+        + "</p>",
+        unsafe_allow_html=True,
+    )
 
 # ── main waveform plot ───────────────────────────────────────────────────────
 if not selected_chs:
@@ -432,12 +667,19 @@ fig.update_layout(
 st.plotly_chart(fig, use_container_width=True)
 
 # ── hypnogram overview & sleep metrics ──────────────────────────────────────
-if stages and show_hypnogram:
-    stages_norm = normalize_stages(stages)
+if (has_tech or has_yasa) and show_hypnogram:
+    stages_norm = normalize_stages(stages) if stages else []
+
+    # Build YASA stages in (onset, dur, label) form for hypnogram
+    yasa_stages_norm: list[tuple[float, float, str]] = []
+    if yasa_labels:
+        yasa_stages_tuples = [(i * 30.0, 30.0, lbl) for i, lbl in enumerate(yasa_labels)]
+        yasa_stages_norm = normalize_stages(yasa_stages_tuples)
+
+    # ── sleep metrics (from technician stages) ─────────────────────────
     if stages_norm:
         metrics = compute_sleep_metrics(stages_norm, stages, trim_wake=trim_wake)
 
-        # ── sleep metrics (2 rows × 3 cols) ────────────────────────────
         if metrics:
             row1 = st.columns(3)
             row1[0].metric(
@@ -494,11 +736,61 @@ if stages and show_hypnogram:
                     "從記錄起點到最後一個非 W epoch"
                 )
 
-        # ── hypnogram chart ─────────────────────────────────────────────
-        segments = build_hyp_segments(stages_norm)
-        rec_start = meas_date if meas_date else datetime(2000, 1, 1)
+    # ── hypnogram chart ─────────────────────────────────────────────────
+    rec_start = meas_date if meas_date else datetime(2000, 1, 1)
+    epoch_marker_t = rec_start + timedelta(seconds=cur_epoch * epoch_len + epoch_len / 2)
 
-        # per-stage traces with None gaps
+    tech_segments = build_hyp_segments(stages_norm) if stages_norm else []
+    yasa_segments = build_hyp_segments(yasa_stages_norm) if yasa_stages_norm else []
+
+    y_axis_cfg = dict(
+        tickvals=[0, 1, 2, 3, 4],
+        ticktext=["W", "REM", "N1", "N2", "N3"],
+        range=[4.5, -0.5],
+    )
+
+    if tech_segments and yasa_segments:
+        # ── dual subplot: technician (top) + YASA (bottom) ─────────────
+        fig_hyp = make_subplots(
+            rows=2, cols=1, shared_xaxes=True,
+            subplot_titles=["技師判讀", "自動判期（YASA）"],
+            vertical_spacing=0.12,
+        )
+        add_hyp_traces_to_fig(fig_hyp, tech_segments, rec_start, row=1, show_legend=True)
+        add_hyp_traces_to_fig(fig_hyp, yasa_segments, rec_start, row=2, show_legend=False)
+
+        # epoch marker on both rows
+        for r in (1, 2):
+            fig_hyp.add_vline(
+                x=epoch_marker_t, line_dash="dash",
+                line_color="#FFD700", line_width=1.5,
+                row=r, col=1,
+            )
+        fig_hyp.add_annotation(
+            x=epoch_marker_t, y=-0.3, yref="y domain",
+            text=f"Epoch {cur_epoch}", font_color="#FFD700",
+            showarrow=False, row=1, col=1,
+        )
+
+        fig_hyp.update_yaxes(**y_axis_cfg, row=1, col=1)
+        fig_hyp.update_yaxes(**y_axis_cfg, row=2, col=1)
+        fig_hyp.update_xaxes(title="Time", tickformat="%H:%M", row=2, col=1)
+        fig_hyp.update_layout(
+            height=400,
+            margin=dict(l=60, r=80, t=30, b=40),
+            legend=dict(
+                orientation="v", yanchor="middle", y=0.5,
+                xanchor="left", x=1.01,
+            ),
+            hovermode="x", dragmode="zoom",
+        )
+        st.plotly_chart(fig_hyp, use_container_width=True)
+
+    elif tech_segments or yasa_segments:
+        # ── single hypnogram (technician-only or YASA-only) ────────────
+        segments = tech_segments or yasa_segments
+
+        fig_hyp = go.Figure()
         stage_x: dict[str, list] = {s: [] for s in HYP_STAGE_Y}
         stage_y_data: dict[str, list] = {s: [] for s in HYP_STAGE_Y}
         for s0, s1, stg in segments:
@@ -507,7 +799,6 @@ if stages and show_hypnogram:
             stage_x[stg].extend([t0, t1, None])
             stage_y_data[stg].extend([HYP_STAGE_Y[stg], HYP_STAGE_Y[stg], None])
 
-        fig_hyp = go.Figure()
         for stg in ("W", "REM", "N1", "N2", "N3"):
             if stage_x[stg]:
                 fig_hyp.add_trace(
@@ -543,9 +834,8 @@ if stages and show_hypnogram:
             )
 
         # current-epoch vertical marker
-        epoch_t = rec_start + timedelta(seconds=cur_epoch * epoch_len + epoch_len / 2)
         fig_hyp.add_vline(
-            x=epoch_t,
+            x=epoch_marker_t,
             line_dash="dash",
             line_color="#FFD700",
             line_width=1.5,
@@ -557,11 +847,7 @@ if stages and show_hypnogram:
         fig_hyp.update_layout(
             height=250,
             margin=dict(l=60, r=80, t=10, b=40),
-            yaxis=dict(
-                tickvals=[0, 1, 2, 3, 4],
-                ticktext=["W", "REM", "N1", "N2", "N3"],
-                range=[4.5, -0.5],
-            ),
+            yaxis=y_axis_cfg,
             xaxis=dict(title="Time", tickformat="%H:%M"),
             legend=dict(
                 orientation="v",
