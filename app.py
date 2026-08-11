@@ -11,6 +11,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 from sklearn.metrics import confusion_matrix as sk_confusion_matrix, cohen_kappa_score
+from scipy.signal import welch as scipy_welch
 
 # ── page config ──────────────────────────────────────────────────────────────
 st.set_page_config(page_title="EDF Viewer", layout="wide")
@@ -260,6 +261,45 @@ def compute_sleep_metrics(stages_norm, stages_all, trim_wake=True):
         tib_end_s=tib_end,
         trimmed=trim_wake,
     )
+
+
+@st.cache_data(show_spinner=False)
+def compute_psd_by_stage(_raw, edf_path: str, ch_name: str,
+                          per_epoch_key: tuple, epoch_len: float):
+    """Compute Welch PSD for each sleep stage on a single EEG channel.
+
+    *_raw* is prefixed with _ so st.cache_data skips hashing it;
+    *edf_path*, *ch_name*, *per_epoch_key*, *epoch_len* serve as cache keys.
+    Returns ``{stage: (freqs, psd_µV²_Hz)}`` for 0.5–30 Hz.
+    """
+    sfreq = _raw.info["sfreq"]
+    ch_idx = _raw.ch_names.index(ch_name)
+    nperseg = int(4 * sfreq)  # 4 s → ~0.25 Hz resolution
+    n_samples = _raw.n_times
+    per_epoch = list(per_epoch_key)
+
+    full_data = _raw.get_data(picks=[ch_idx])[0]  # (n_times,)
+
+    result = {}
+    for stage in ("W", "N1", "N2", "N3", "REM"):
+        epoch_indices = [i for i, s in enumerate(per_epoch) if s == stage]
+        if not epoch_indices:
+            continue
+        segments = []
+        for ei in epoch_indices:
+            i_s = int(ei * epoch_len * sfreq)
+            i_e = int(min((ei + 1) * epoch_len * sfreq, n_samples))
+            if i_s < n_samples and i_e > i_s:
+                segments.append(full_data[i_s:i_e])
+        if not segments:
+            continue
+        signal = np.concatenate(segments)
+        freqs, psd = scipy_welch(signal, fs=sfreq,
+                                  nperseg=min(nperseg, len(signal)))
+        psd *= 1e12  # V²/Hz → µV²/Hz
+        mask = (freqs >= 0.5) & (freqs <= 30)
+        result[stage] = (freqs[mask], psd[mask])
+    return result
 
 
 # ── YASA helpers ─────────────────────────────────────────────────────────────
@@ -518,6 +558,18 @@ else:
 active_per_epoch = (
     yasa_per_epoch if jump_source == "自動" else per_epoch_stages
 )
+
+# ── sidebar: PSD channel selection ────────────────────────────────────────────
+psd_ch = None
+if active_per_epoch is not None:
+    st.sidebar.subheader("📈 功率頻譜")
+    _eeg_chs = [ch for ch in all_chs
+                if any(k in ch.lower() for k in
+                       ("eeg", "fpz", "pz", "cz", "c3", "c4", "f3", "f4",
+                        "o1", "o2", "fz", "oz"))]
+    if not _eeg_chs:
+        _eeg_chs = all_chs
+    psd_ch = st.sidebar.selectbox("分析頻道", _eeg_chs, index=0)
 
 # ── epoch state ──────────────────────────────────────────────────────────────
 # The number_input owns st.session_state.epoch via key="epoch".
@@ -945,20 +997,27 @@ if has_both:
             auto_tib_epochs = sum(auto_counts.values())
 
             # Bar chart
+            exclude_w = st.checkbox(
+                "只顯示睡眠期（排除 W）",
+                value=True,
+                help="W 時間過長會壓縮其他階段的視覺比例，勾選後只顯示 N1 / N2 / N3 / REM",
+            )
+            bar_stages = [s for s in _COMPARE_STAGES if not (exclude_w and s == "W")]
+
             fig_bar = go.Figure()
-            tech_mins = [tech_counts[s] * epoch_min for s in _COMPARE_STAGES]
-            auto_mins = [auto_counts[s] * epoch_min for s in _COMPARE_STAGES]
+            tech_mins = [tech_counts[s] * epoch_min for s in bar_stages]
+            auto_mins = [auto_counts[s] * epoch_min for s in bar_stages]
 
             fig_bar.add_trace(go.Bar(
                 name="技師判讀",
-                x=_COMPARE_STAGES, y=tech_mins,
+                x=bar_stages, y=tech_mins,
                 text=[f"{v:.1f}" for v in tech_mins],
                 textposition="outside",
                 marker_color="#2C5F8A",
             ))
             fig_bar.add_trace(go.Bar(
                 name="自動判期",
-                x=_COMPARE_STAGES, y=auto_mins,
+                x=bar_stages, y=auto_mins,
                 text=[f"{v:.1f}" for v in auto_mins],
                 textposition="outside",
                 marker_color="#7EC8E3",
@@ -1000,6 +1059,100 @@ if has_both:
                          hide_index=True)
 
             st.caption("W 的百分比以 TIB 為分母，其餘各期以 TST 為分母")
+
+# ── EEG Power Spectrum by Sleep Stage ─────────────────────────────────────────
+if active_per_epoch is not None and psd_ch is not None:
+    with st.expander("📊 各階段 EEG 功率頻譜", expanded=False):
+        with st.spinner("計算功率頻譜…"):
+            psd_result = compute_psd_by_stage(
+                raw, edf_path, psd_ch,
+                tuple(active_per_epoch), epoch_len,
+            )
+
+        if psd_result:
+            _FREQ_BANDS = {
+                "Delta": (0.5, 4),
+                "Theta": (4, 8),
+                "Alpha": (8, 12),
+                "Sigma": (12, 16),
+                "Beta": (16, 30),
+            }
+            _BAND_BG = [
+                ("Delta", "rgba(52,152,219,0.07)"),
+                ("Theta", "rgba(46,204,113,0.07)"),
+                ("Alpha", "rgba(241,196,15,0.07)"),
+                ("Sigma", "rgba(155,89,182,0.07)"),
+                ("Beta",  "rgba(231,76,60,0.07)"),
+            ]
+
+            fig_psd = go.Figure()
+
+            # frequency band background shading
+            for bname, bg in _BAND_BG:
+                f_lo, f_hi = _FREQ_BANDS[bname]
+                fig_psd.add_vrect(
+                    x0=f_lo, x1=f_hi, fillcolor=bg, line_width=0,
+                    annotation_text=bname,
+                    annotation_position="top",
+                    annotation_font_size=10,
+                    annotation_font_color="#999",
+                )
+
+            for stage in ("W", "N1", "N2", "N3", "REM"):
+                if stage not in psd_result:
+                    continue
+                freqs, psd = psd_result[stage]
+                fig_psd.add_trace(go.Scatter(
+                    x=freqs, y=psd, mode="lines",
+                    name=stage,
+                    line=dict(color=HYP_COLORS[stage], width=2),
+                    hovertemplate="%{x:.1f} Hz: %{y:.2f} µV²/Hz<extra>"
+                                 + stage + "</extra>",
+                ))
+
+            fig_psd.update_layout(
+                xaxis_title="頻率 (Hz)",
+                yaxis_title="功率 (µV²/Hz)",
+                yaxis_type="log",
+                height=450,
+                margin=dict(l=60, r=20, t=30, b=50),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                            xanchor="right", x=1),
+                hovermode="x unified",
+                dragmode="zoom",
+            )
+            fig_psd.update_xaxes(range=[0.5, 30], dtick=2)
+            st.plotly_chart(fig_psd, use_container_width=True)
+
+            _src_label = ("技師判讀" if jump_source == "技師"
+                          else "自動判期（YASA）")
+            st.caption(f"頻道：{psd_ch}　｜　分期來源：{_src_label}")
+
+            # Band power table
+            band_rows = []
+            for stage in ("W", "N1", "N2", "N3", "REM"):
+                if stage not in psd_result:
+                    continue
+                freqs, psd = psd_result[stage]
+                total = np.sum(psd)
+                row = {"階段": stage}
+                for bname, (f_lo, f_hi) in _FREQ_BANDS.items():
+                    bmask = (freqs >= f_lo) & (freqs <= f_hi)
+                    bp = np.sum(psd[bmask]) if bmask.any() else 0.0
+                    row[bname] = (f"{bp / total * 100:.1f}%"
+                                  if total > 0 else "—")
+                band_rows.append(row)
+
+            if band_rows:
+                st.dataframe(pd.DataFrame(band_rows),
+                             use_container_width=True, hide_index=True)
+                st.caption(
+                    "N3 的 Delta 佔比最高（慢波睡眠）、REM 的 Theta 較明顯、"
+                    "W 的 Alpha 在閉眼放鬆時會升高、"
+                    "N2 可看到 Sigma（睡眠紡錘波）。"
+                )
+        else:
+            st.info("所選分期來源沒有可用的階段標註，無法計算功率頻譜。")
 
 # ── channel statistics (collapsed) ──────────────────────────────────────────
 with st.expander("📈 Channel statistics", expanded=False):
